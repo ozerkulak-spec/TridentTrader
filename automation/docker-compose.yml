@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # Main trading bot
+  bot:
+    build: .
+    container_name: trident-bot
+    ports:
+      - "8000:8000"
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - USE_TESTNET=${USE_TESTNET:-true}
+      - DEFAULT_RISK_PERCENT=${DEFAULT_RISK_PERCENT:-1.0}
+      - MAX_OPEN_POSITIONS=${MAX_OPEN_POSITIONS:-5}
+      - TRADING_MODE=${TRADING_MODE:-spot}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DASHBOARD_AUTH_TOKEN=${DASHBOARD_AUTH_TOKEN:-}
+      - ENABLE_TRAILING_STOP=${ENABLE_TRAILING_STOP:-false}
+      - TRAILING_STOP_PERCENT=${TRAILING_STOP_PERCENT:-1.5}
+      - ENABLE_PARTIAL_CLOSE=${ENABLE_PARTIAL_CLOSE:-true}
+      - PARTIAL_CLOSE_PERCENT=${PARTIAL_CLOSE_PERCENT:-50}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - trident-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Backup service (runs daily)
+  backup:
+    image: alpine:latest
+    container_name: trident-backup
+    volumes:
+      - ./data:/data
+      - ./backups:/backups
+    command: >
+      sh -c "
+      while true; do
+        tar -czf /backups/backup-$$(date +%Y%m%d-%H%M%S).tar.gz /data &&
+        find /backups -name 'backup-*.tar.gz' -mtime +7 -delete &&
+        sleep 86400;
+      done
+      "
+    restart: unless-stopped
+    networks:
+      - trident-network
+
+  # Monitoring (optional - Prometheus)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trident-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - trident-network
+    profiles:
+      - monitoring
+
+  # Grafana (optional - visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trident-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+    networks:
+      - trident-network
+    profiles:
+      - monitoring
+    depends_on:
+      - prometheus
+
+networks:
+  trident-network:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

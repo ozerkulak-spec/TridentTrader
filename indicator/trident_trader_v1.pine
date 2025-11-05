@@ -1,0 +1,418 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TridentTrader
+
+//@version=5
+indicator("Trident Trader Suite", shorttitle="Trident", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ============================================================================
+// TRIDENT TRADER - Professional Trading Suite
+// Combining Trend Following + Momentum Analysis + Liquidity Zones
+// ============================================================================
+
+// ==================== INPUT SETTINGS ====================
+
+// Mode Selection
+tradingMode = input.string("Balanced", "Trading Mode", options=["Scalping", "Balanced", "Swing Trading"], 
+  tooltip="Scalping: More signals, lower timeframes | Balanced: Medium sensitivity | Swing: Fewer, higher quality signals")
+
+// Trend Settings
+trendType = input.string("Supertrend", "Trend Method", options=["Supertrend", "EMA Cross", "ADX"], group="Trend Analysis")
+superTrendLen = input.int(10, "Supertrend Length", minval=1, group="Trend Analysis")
+superTrendMult = input.float(3.0, "Supertrend Multiplier", minval=0.1, step=0.1, group="Trend Analysis")
+emaFast = input.int(20, "Fast EMA Length", minval=1, group="Trend Analysis")
+emaSlow = input.int(50, "Slow EMA Length", minval=1, group="Trend Analysis")
+adxLen = input.int(14, "ADX Length", minval=1, group="Trend Analysis")
+adxThreshold = input.int(25, "ADX Trend Threshold", minval=1, group="Trend Analysis")
+
+// Momentum Settings
+momentumType = input.string("RSI", "Momentum Indicator", options=["RSI", "MACD", "Stochastic", "Composite"], group="Momentum")
+rsiLen = input.int(14, "RSI Length", minval=1, group="Momentum")
+rsiOverbought = input.int(70, "RSI Overbought", minval=50, maxval=100, group="Momentum")
+rsiOversold = input.int(30, "RSI Oversold", minval=0, maxval=50, group="Momentum")
+macdFast = input.int(12, "MACD Fast Length", minval=1, group="Momentum")
+macdSlow = input.int(26, "MACD Slow Length", minval=1, group="Momentum")
+macdSignal = input.int(9, "MACD Signal Length", minval=1, group="Momentum")
+stochLen = input.int(14, "Stochastic Length", minval=1, group="Momentum")
+stochSmooth = input.int(3, "Stochastic Smooth", minval=1, group="Momentum")
+
+// Liquidity Zone Settings
+pivotLeftBars = input.int(5, "Pivot Left Bars", minval=1, group="Liquidity Zones")
+pivotRightBars = input.int(5, "Pivot Right Bars", minval=1, group="Liquidity Zones")
+maxZones = input.int(5, "Max Active Zones", minval=1, maxval=20, group="Liquidity Zones")
+showOrderBlocks = input.bool(true, "Show Order Blocks", group="Liquidity Zones")
+showFVG = input.bool(true, "Show Fair Value Gaps", group="Liquidity Zones")
+
+// Risk Management Settings
+atrLen = input.int(14, "ATR Length", minval=1, group="Risk Management")
+stopLossATR = input.float(1.5, "Stop Loss (ATR Multiplier)", minval=0.1, step=0.1, group="Risk Management")
+takeProfitATR1 = input.float(2.0, "Take Profit 1 (ATR Multiplier)", minval=0.1, step=0.1, group="Risk Management")
+takeProfitATR2 = input.float(3.5, "Take Profit 2 (ATR Multiplier)", minval=0.1, step=0.1, group="Risk Management")
+useTrailingStop = input.bool(true, "Enable Trailing Stop", group="Risk Management")
+trailATR = input.float(1.0, "Trailing Stop (ATR Multiplier)", minval=0.1, step=0.1, group="Risk Management")
+
+// Multi-Timeframe Confirmation
+useHTFConfirm = input.bool(false, "Use Higher Timeframe Confirmation", group="Advanced")
+htfTimeframe = input.timeframe("60", "Higher Timeframe", group="Advanced")
+
+// Display Settings
+showDashboard = input.bool(true, "Show Dashboard", group="Display")
+showSignals = input.bool(true, "Show Buy/Sell Signals", group="Display")
+showZones = input.bool(true, "Show Support/Resistance Zones", group="Display")
+showRiskLevels = input.bool(true, "Show Stop Loss / Take Profit", group="Display")
+
+// Color Settings
+bullColor = input.color(color.new(color.green, 0), "Bullish Color", group="Colors")
+bearColor = input.color(color.new(color.red, 0), "Bearish Color", group="Colors")
+demandZoneColor = input.color(color.new(color.green, 80), "Demand Zone Color", group="Colors")
+supplyZoneColor = input.color(color.new(color.red, 80), "Supply Zone Color", group="Colors")
+
+// ==================== MODE ADJUSTMENTS ====================
+
+// Adjust sensitivity based on trading mode
+modeMultiplier = tradingMode == "Scalping" ? 0.7 : tradingMode == "Swing Trading" ? 1.3 : 1.0
+adjustedSuperTrendLen = int(superTrendLen * modeMultiplier)
+adjustedPivotBars = int(pivotLeftBars * modeMultiplier)
+
+// ==================== TREND CALCULATION ====================
+
+// Supertrend
+[superTrend, superTrendDir] = ta.supertrend(superTrendMult, adjustedSuperTrendLen)
+isBullishST = superTrendDir < 0
+isBearishST = superTrendDir > 0
+
+// EMA Cross
+emaFastLine = ta.ema(close, emaFast)
+emaSlowLine = ta.ema(close, emaSlow)
+isBullishEMA = emaFastLine > emaSlowLine
+isBearishEMA = emaFastLine < emaSlowLine
+
+// ADX
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+isBullishADX = diPlus > diMinus and adxValue > adxThreshold
+isBearishADX = diMinus > diPlus and adxValue > adxThreshold
+trendStrength = adxValue
+
+// Select trend method
+isBullishTrend = trendType == "Supertrend" ? isBullishST : trendType == "EMA Cross" ? isBullishEMA : isBullishADX
+isBearishTrend = trendType == "Supertrend" ? isBearishST : trendType == "EMA Cross" ? isBearishEMA : isBearishADX
+
+// Higher Timeframe Confirmation
+htfTrendBullish = useHTFConfirm ? request.security(syminfo.tickerid, htfTimeframe, isBullishTrend) : true
+htfTrendBearish = useHTFConfirm ? request.security(syminfo.tickerid, htfTimeframe, isBearishTrend) : true
+
+// ==================== MOMENTUM CALCULATION ====================
+
+// RSI
+rsiValue = ta.rsi(close, rsiLen)
+rsiRising = rsiValue > rsiValue[1]
+rsiFalling = rsiValue < rsiValue[1]
+rsiOB = rsiValue > rsiOverbought
+rsiOS = rsiValue < rsiOversold
+rsiCrossAbove50 = ta.crossover(rsiValue, 50)
+rsiCrossBelow50 = ta.crossunder(rsiValue, 50)
+
+// MACD
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBullish = macdLine > macdSignalLine and macdHist > macdHist[1]
+macdBearish = macdLine < macdSignalLine and macdHist < macdHist[1]
+macdCrossUp = ta.crossover(macdLine, macdSignalLine)
+macdCrossDown = ta.crossunder(macdLine, macdSignalLine)
+
+// Stochastic
+stochK = ta.stoch(close, high, low, stochLen)
+stochD = ta.sma(stochK, stochSmooth)
+stochBullish = stochK > stochD and stochK > stochK[1]
+stochBearish = stochK < stochD and stochK < stochK[1]
+stochOS_Level = stochK < 20
+stochOB_Level = stochK > 80
+
+// Composite Momentum (combining multiple)
+compositeBullish = (rsiValue > 50 and rsiRising) or macdBullish or stochBullish
+compositeBearish = (rsiValue < 50 and rsiFalling) or macdBearish or stochBearish
+
+// Select momentum method
+isBullishMomentum = momentumType == "RSI" ? (rsiValue > 50 and rsiRising) or rsiCrossAbove50 : 
+  momentumType == "MACD" ? macdBullish or macdCrossUp : 
+  momentumType == "Stochastic" ? stochBullish : compositeBullish
+
+isBearishMomentum = momentumType == "RSI" ? (rsiValue < 50 and rsiFalling) or rsiCrossBelow50 : 
+  momentumType == "MACD" ? macdBearish or macdCrossDown : 
+  momentumType == "Stochastic" ? stochBearish : compositeBearish
+
+// ==================== LIQUIDITY ZONES ====================
+
+// Pivot Detection
+pivotHigh = ta.pivothigh(high, adjustedPivotBars, adjustedPivotBars)
+pivotLow = ta.pivotlow(low, adjustedPivotBars, adjustedPivotBars)
+
+// Store zones using arrays
+var array<float> supplyZones = array.new<float>()
+var array<float> demandZones = array.new<float>()
+var array<int> supplyZoneBars = array.new<int>()
+var array<int> demandZoneBars = array.new<int>()
+
+// Add new zones when pivots form
+if not na(pivotHigh) and showZones
+    if array.size(supplyZones) >= maxZones
+        array.shift(supplyZones)
+        array.shift(supplyZoneBars)
+    array.push(supplyZones, pivotHigh)
+    array.push(supplyZoneBars, bar_index - adjustedPivotBars)
+
+if not na(pivotLow) and showZones
+    if array.size(demandZones) >= maxZones
+        array.shift(demandZones)
+        array.shift(demandZoneBars)
+    array.push(demandZones, pivotLow)
+    array.push(demandZoneBars, bar_index - adjustedPivotBars)
+
+// Find nearest zones
+nearestSupply = array.size(supplyZones) > 0 ? array.max(supplyZones) : na
+nearestDemand = array.size(demandZones) > 0 ? array.min(demandZones) : na
+
+// Check if price is near a zone (within 1%)
+priceNearDemand = not na(nearestDemand) and close <= nearestDemand * 1.01 and close >= nearestDemand * 0.99
+priceNearSupply = not na(nearestSupply) and close >= nearestSupply * 0.99 and close <= nearestSupply * 1.01
+
+// Order Block Detection
+var float lastBullishOB = na
+var float lastBearishOB = na
+
+// Bullish Order Block: Down candle before strong up move
+if showOrderBlocks and close > open and close > close[1] * 1.005 and close[1] < open[1]
+    lastBullishOB := low[1]
+
+// Bearish Order Block: Up candle before strong down move  
+if showOrderBlocks and close < open and close < close[1] * 0.995 and close[1] > open[1]
+    lastBearishOB := high[1]
+
+// Fair Value Gap Detection
+bullishFVG = showFVG and low > high[2] and close[1] > open[1]
+bearishFVG = showFVG and high < low[2] and close[1] < open[1]
+
+// ==================== SIGNAL GENERATION ====================
+
+// ATR for volatility adjustment
+atrValue = ta.atr(atrLen)
+
+// Buy Signal Conditions
+buyCondition1 = isBullishTrend and htfTrendBullish
+buyCondition2 = isBullishMomentum
+buyCondition3 = priceNearDemand or (not na(lastBullishOB) and close <= lastBullishOB * 1.02)
+buySignal = showSignals and buyCondition1 and buyCondition2 and (buyCondition3 or not showZones)
+
+// Strong Buy (all three conditions + momentum confirmation)
+strongBuySignal = buySignal and buyCondition3 and rsiOS
+
+// Sell Signal Conditions
+sellCondition1 = isBearishTrend and htfTrendBearish
+sellCondition2 = isBearishMomentum
+sellCondition3 = priceNearSupply or (not na(lastBearishOB) and close >= lastBearishOB * 0.98)
+sellSignal = showSignals and sellCondition1 and sellCondition2 and (sellCondition3 or not showZones)
+
+// Strong Sell
+strongSellSignal = sellSignal and sellCondition3 and rsiOB
+
+// ==================== RISK MANAGEMENT ====================
+
+// Store entry details
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit1 = na
+var float takeProfit2 = na
+var bool inLongPosition = false
+var bool inShortPosition = false
+
+// Entry Management
+if buySignal and not inLongPosition
+    entryPrice := close
+    stopLoss := close - (atrValue * stopLossATR)
+    // Use nearest demand or order block as alternative SL
+    if not na(nearestDemand) and nearestDemand < stopLoss
+        stopLoss := nearestDemand * 0.995
+    takeProfit1 := close + (atrValue * takeProfitATR1)
+    takeProfit2 := close + (atrValue * takeProfitATR2)
+    // Adjust TP to nearest supply if applicable
+    if not na(nearestSupply) and nearestSupply < takeProfit2
+        takeProfit1 := nearestSupply * 0.995
+    inLongPosition := true
+    inShortPosition := false
+
+if sellSignal and not inShortPosition
+    entryPrice := close
+    stopLoss := close + (atrValue * stopLossATR)
+    // Use nearest supply or order block as alternative SL
+    if not na(nearestSupply) and nearestSupply > stopLoss
+        stopLoss := nearestSupply * 1.005
+    takeProfit1 := close - (atrValue * takeProfitATR1)
+    takeProfit2 := close - (atrValue * takeProfitATR2)
+    // Adjust TP to nearest demand if applicable
+    if not na(nearestDemand) and nearestDemand > takeProfit2
+        takeProfit1 := nearestDemand * 1.005
+    inShortPosition := true
+    inLongPosition := false
+
+// Trailing Stop Logic
+if useTrailingStop
+    if inLongPosition
+        trailLevel = close - (atrValue * trailATR)
+        if trailLevel > stopLoss
+            stopLoss := trailLevel
+    if inShortPosition
+        trailLevel = close + (atrValue * trailATR)
+        if trailLevel < stopLoss
+            stopLoss := trailLevel
+
+// Exit conditions
+if inLongPosition and (close <= stopLoss or close >= takeProfit2)
+    inLongPosition := false
+    entryPrice := na
+
+if inShortPosition and (close >= stopLoss or close <= takeProfit2)
+    inShortPosition := false
+    entryPrice := na
+
+// Calculate Risk:Reward Ratio
+riskRewardRatio = na(entryPrice) or na(stopLoss) or na(takeProfit1) ? na : 
+  math.abs(takeProfit1 - entryPrice) / math.abs(entryPrice - stopLoss)
+
+// ==================== PLOTTING ====================
+
+// Trend Line
+trendColor = isBullishTrend ? bullColor : isBearishTrend ? bearColor : color.gray
+plot(trendType == "Supertrend" ? superTrend : trendType == "EMA Cross" ? emaFastLine : na, 
+  "Trend Line", color=trendColor, linewidth=2)
+
+// Candle Coloring
+barcolor(isBullishTrend and isBullishMomentum ? color.new(bullColor, 50) : 
+  isBearishTrend and isBearishMomentum ? color.new(bearColor, 50) : na)
+
+// Buy/Sell Signals
+plotshape(buySignal and not strongBuySignal, "Buy Signal", shape.triangleup, location.belowbar, 
+  color.new(bullColor, 0), size=size.small, text="BUY")
+plotshape(strongBuySignal, "Strong Buy", shape.triangleup, location.belowbar, 
+  color.new(bullColor, 0), size=size.normal, text="BUY★")
+
+plotshape(sellSignal and not strongSellSignal, "Sell Signal", shape.triangledown, location.abovebar, 
+  color.new(bearColor, 0), size=size.small, text="SELL")
+plotshape(strongSellSignal, "Strong Sell", shape.triangledown, location.abovebar, 
+  color.new(bearColor, 0), size=size.normal, text="SELL★")
+
+// Risk Levels
+plot(showRiskLevels and not na(stopLoss) ? stopLoss : na, "Stop Loss", color.red, 2, plot.style_cross)
+plot(showRiskLevels and not na(takeProfit1) ? takeProfit1 : na, "TP1", color.green, 1, plot.style_cross)
+plot(showRiskLevels and not na(takeProfit2) ? takeProfit2 : na, "TP2", color.new(color.green, 30), 1, plot.style_cross)
+
+// Liquidity Zones (using lines for recent zones)
+if showZones
+    // Draw most recent supply zones
+    for i = 0 to math.min(array.size(supplyZones) - 1, 2)
+        if i < array.size(supplyZones)
+            zonePrice = array.get(supplyZones, array.size(supplyZones) - 1 - i)
+            zoneLine = line.new(bar_index - 100, zonePrice, bar_index, zonePrice, 
+              color=supplyZoneColor, width=2, style=line.style_dashed)
+            line.delete(zoneLine[1])
+    
+    // Draw most recent demand zones
+    for i = 0 to math.min(array.size(demandZones) - 1, 2)
+        if i < array.size(demandZones)
+            zonePrice = array.get(demandZones, array.size(demandZones) - 1 - i)
+            zoneLine = line.new(bar_index - 100, zonePrice, bar_index, zonePrice, 
+              color=demandZoneColor, width=2, style=line.style_dashed)
+            line.delete(zoneLine[1])
+
+// Order Blocks
+bgcolor(not na(lastBullishOB) and close >= lastBullishOB and close <= lastBullishOB * 1.03 ? 
+  color.new(bullColor, 90) : na, title="Bullish OB")
+bgcolor(not na(lastBearishOB) and close <= lastBearishOB and close >= lastBearishOB * 0.97 ? 
+  color.new(bearColor, 90) : na, title="Bearish OB")
+
+// Fair Value Gaps
+bgcolor(bullishFVG ? color.new(bullColor, 95) : na, title="Bullish FVG")
+bgcolor(bearishFVG ? color.new(bearColor, 95) : na, title="Bearish FVG")
+
+// ==================== DASHBOARD ====================
+
+if showDashboard
+    var table dashboard = table.new(position.top_right, 2, 8, 
+      bgcolor=color.new(color.black, 85), border_width=2, border_color=color.gray)
+    
+    // Header
+    if barstate.islast
+        table.cell(dashboard, 0, 0, "TRIDENT TRADER", text_color=color.white, text_size=size.normal)
+        table.cell(dashboard, 1, 0, "STATUS", text_color=color.white, text_size=size.normal)
+        
+        // Trend
+        trendText = isBullishTrend ? "BULLISH ▲" : isBearishTrend ? "BEARISH ▼" : "NEUTRAL →"
+        trendCol = isBullishTrend ? bullColor : isBearishTrend ? bearColor : color.gray
+        table.cell(dashboard, 0, 1, "Trend", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 1, trendText, text_color=trendCol, text_size=size.small)
+        
+        // Momentum
+        momentumText = isBullishMomentum ? "BULLISH ▲" : isBearishMomentum ? "BEARISH ▼" : "NEUTRAL"
+        momentumCol = isBullishMomentum ? bullColor : isBearishMomentum ? bearColor : color.gray
+        table.cell(dashboard, 0, 2, "Momentum", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 2, momentumText, text_color=momentumCol, text_size=size.small)
+        
+        // RSI Value
+        rsiColor = rsiOS ? bullColor : rsiOB ? bearColor : color.orange
+        table.cell(dashboard, 0, 3, "RSI", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 3, str.tostring(math.round(rsiValue, 1)), text_color=rsiColor, text_size=size.small)
+        
+        // ADX Strength
+        table.cell(dashboard, 0, 4, "Trend Strength", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 4, str.tostring(math.round(trendStrength, 1)), 
+          text_color=trendStrength > 25 ? color.lime : color.orange, text_size=size.small)
+        
+        // Nearest Support
+        table.cell(dashboard, 0, 5, "Support", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 5, not na(nearestDemand) ? str.tostring(nearestDemand, format.mintick) : "N/A", 
+          text_color=color.green, text_size=size.small)
+        
+        // Nearest Resistance
+        table.cell(dashboard, 0, 6, "Resistance", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 6, not na(nearestSupply) ? str.tostring(nearestSupply, format.mintick) : "N/A", 
+          text_color=color.red, text_size=size.small)
+        
+        // Risk:Reward
+        table.cell(dashboard, 0, 7, "R:R Ratio", text_color=color.white, text_size=size.small)
+        table.cell(dashboard, 1, 7, not na(riskRewardRatio) ? str.tostring(math.round(riskRewardRatio, 2)) + ":1" : "N/A", 
+          text_color=color.yellow, text_size=size.small)
+
+// ==================== ALERTS ====================
+
+// Buy/Sell Signal Alerts
+alertcondition(buySignal, title="Buy Signal", message="🟢 TRIDENT BUY Signal on {{ticker}} {{interval}}")
+alertcondition(strongBuySignal, title="Strong Buy Signal", message="🟢⭐ TRIDENT STRONG BUY on {{ticker}} {{interval}}")
+alertcondition(sellSignal, title="Sell Signal", message="🔴 TRIDENT SELL Signal on {{ticker}} {{interval}}")
+alertcondition(strongSellSignal, title="Strong Sell Signal", message="🔴⭐ TRIDENT STRONG SELL on {{ticker}} {{interval}}")
+
+// Zone Alerts
+alertcondition(priceNearDemand and isBullishMomentum, title="Price at Demand Zone", 
+  message="💰 Price entered DEMAND zone on {{ticker}} - Potential BUY setup")
+alertcondition(priceNearSupply and isBearishMomentum, title="Price at Supply Zone", 
+  message="💰 Price entered SUPPLY zone on {{ticker}} - Potential SELL setup")
+
+// Trend Change Alerts
+trendChangeUp = ta.crossover(isBullishTrend ? 1 : 0, 0.5)
+trendChangeDown = ta.crossunder(isBullishTrend ? 1 : 0, 0.5)
+alertcondition(trendChangeUp, title="Trend Changed to Bullish", message="📈 Trend turned BULLISH on {{ticker}}")
+alertcondition(trendChangeDown, title="Trend Changed to Bearish", message="📉 Trend turned BEARISH on {{ticker}}")
+
+// Momentum Shift Alerts
+alertcondition(rsiCrossAbove50 and isBullishTrend, title="Momentum Bullish", 
+  message="⚡ Bullish momentum shift on {{ticker}} - RSI crossed above 50")
+alertcondition(rsiCrossBelow50 and isBearishTrend, title="Momentum Bearish", 
+  message="⚡ Bearish momentum shift on {{ticker}} - RSI crossed below 50")
+
+// Risk Level Alerts
+alertcondition(inLongPosition and close <= stopLoss, title="Long Stop Loss Hit", 
+  message="🛑 STOP LOSS hit on LONG position - {{ticker}}")
+alertcondition(inShortPosition and close >= stopLoss, title="Short Stop Loss Hit", 
+  message="🛑 STOP LOSS hit on SHORT position - {{ticker}}")
+alertcondition(inLongPosition and close >= takeProfit1, title="Long Take Profit 1", 
+  message="✅ Take Profit 1 reached on LONG - {{ticker}}")
+alertcondition(inShortPosition and close <= takeProfit1, title="Short Take Profit 1", 
+  message="✅ Take Profit 1 reached on SHORT - {{ticker}}")
+
+// ==================== END OF INDICATOR ====================

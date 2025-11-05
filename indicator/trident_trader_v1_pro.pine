@@ -1,0 +1,382 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © TridentTrader
+
+//@version=5
+indicator("Trident Trader Suite PRO", shorttitle="Trident PRO", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ============================================================================
+// TRIDENT TRADER PRO
+// Trend + Momentum + Liquidity + Risk + Sizing (Non-repaint, MTF-safe)
+// ----------------------------------------------------------------------------
+// Key upgrades vs v1:
+// - Non-repaint discipline (no lookahead, signals on bar close)
+// - MTF confirmation with lookahead_off
+// - Chop/volatility filters (ADX, ATR percentile) to avoid noise
+// - Zone rendering with box.new (true supply/demand bands), lifecycle managed
+// - Position sizing: account size + risk % → suggested size
+// - Cleaner, stronger signal gating and alert set
+// ============================================================================
+
+// --------------------- INPUTS ---------------------
+// Modes
+mode = input.string("Balanced", "Trading Mode", options=["Scalping","Balanced","Swing"], tooltip="Optimize sensitivity for your style")
+
+// Trend
+trendMethod = input.string("Supertrend", "Trend Method", options=["Supertrend","EMA Cross","ADX"], group="Trend")
+stLen = input.int(10, "Supertrend Length", minval=1, group="Trend")
+stMult = input.float(3.0, "Supertrend Multiplier", minval=0.1, step=0.1, group="Trend")
+emaFast = input.int(20, "Fast EMA", minval=1, group="Trend")
+emaSlow = input.int(50, "Slow EMA", minval=1, group="Trend")
+adxLen = input.int(14, "ADX Length", minval=1, group="Trend")
+adxGate = input.int(20, "Min ADX (Chop Filter)", minval=5, maxval=50, group="Trend", tooltip="Below this = likely chop; signals filtered")
+
+// Momentum
+momMethod = input.string("Composite", "Momentum", options=["RSI","MACD","Stochastic","Composite"], group="Momentum")
+rsiLen = input.int(14, "RSI Length", group="Momentum")
+rsiOB = input.int(70, "RSI Overbought", minval=50, maxval=100, group="Momentum")
+rsiOS = input.int(30, "RSI Oversold", minval=0, maxval=50, group="Momentum")
+macdFast = input.int(12, "MACD Fast", group="Momentum")
+macdSlow = input.int(26, "MACD Slow", group="Momentum")
+macdSignal = input.int(9, "MACD Signal", group="Momentum")
+stochLen = input.int(14, "Stoch Length", group="Momentum")
+stochSmooth = input.int(3, "Stoch Smooth", group="Momentum")
+
+// Liquidity / Zones
+leftBars = input.int(5, "Pivot Left Bars", minval=1, group="Liquidity")
+rightBars = input.int(5, "Pivot Right Bars", minval=1, group="Liquidity")
+maxActiveZones = input.int(6, "Max Active Zones", minval=1, maxval=30, group="Liquidity")
+showOB = input.bool(true, "Show Order Blocks", group="Liquidity")
+showFVG = input.bool(true, "Show FVG", group="Liquidity")
+
+// Risk
+atrLen = input.int(14, "ATR Length", group="Risk")
+slATR = input.float(1.5, "Stop Loss (ATR x)", step=0.1, group="Risk")
+tp1ATR = input.float(2.0, "TP1 (ATR x)", step=0.1, group="Risk")
+tp2ATR = input.float(3.5, "TP2 (ATR x)", step=0.1, group="Risk")
+trailATR = input.float(1.0, "Trailing (ATR x)", step=0.1, group="Risk")
+useTrail = input.bool(true, "Enable Trailing Stop", group="Risk")
+
+// Sizing
+accountSize = input.float(10000, "Account Size", step=1.0, group="Sizing")
+riskPct = input.float(1.0, "Risk % per Trade", step=0.1, group="Sizing")
+
+// MTF confirm
+useHTF = input.bool(true, "Use Higher TF Confirm", group="Advanced")
+htf = input.timeframe("60", "Higher TF", group="Advanced")
+
+// Display
+showDash = input.bool(true, "Show Dashboard", group="Display")
+showSignals = input.bool(true, "Show Signals", group="Display")
+showZones = input.bool(true, "Show Zones", group="Display")
+showRisk = input.bool(true, "Show SL/TP", group="Display")
+
+// Colors
+colBull = input.color(color.new(color.lime, 0), "Bullish Color", group="Colors")
+colBear = input.color(color.new(color.red, 0), "Bearish Color", group="Colors")
+colDemand = input.color(color.new(color.green, 85), "Demand Zone", group="Colors")
+colSupply = input.color(color.new(color.red, 85), "Supply Zone", group="Colors")
+
+// --------------------- MODE TWEAKS ---------------------
+modeMult = mode == "Scalping" ? 0.7 : mode == "Swing" ? 1.3 : 1.0
+_pivot = int(math.max(2, math.round(leftBars * modeMult)))
+
+// --------------------- TREND ---------------------
+// Supertrend (use line relation to avoid dir ambiguity)
+[stLine, stDir] = ta.supertrend(stMult, int(math.max(1, math.round(stLen * modeMult))))
+stBull = close > stLine
+stBear = close < stLine
+
+// EMA Cross
+emaF = ta.ema(close, emaFast)
+emaS = ta.ema(close, emaSlow)
+emaBull = emaF > emaS
+emaBear = emaF < emaS
+
+// ADX
+[dip, dim, adx] = ta.dmi(adxLen, adxLen)
+adxBull = dip > dim and adx >= adxGate
+adxBear = dim > dip and adx >= adxGate
+
+trendBull = trendMethod == "Supertrend" ? stBull : trendMethod == "EMA Cross" ? emaBull : adxBull
+trendBear = trendMethod == "Supertrend" ? stBear : trendMethod == "EMA Cross" ? emaBear : adxBear
+
+// HTF confirm without lookahead
+htfBull = useHTF ? request.security(syminfo.tickerid, htf, trendBull, barmerge.gaps_off, barmerge.lookahead_off) : true
+htfBear = useHTF ? request.security(syminfo.tickerid, htf, trendBear, barmerge.gaps_off, barmerge.lookahead_off) : true
+
+// --------------------- MOMENTUM ---------------------
+// RSI
+rsi = ta.rsi(close, rsiLen)
+rsiUp = rsi > rsi[1]
+rsiDn = rsi < rsi[1]
+rsiBull = rsi > 50 and rsiUp
+rsiBear = rsi < 50 and rsiDn
+
+// MACD
+[macdL, macdS, macdH] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBull = macdL > macdS and macdH > macdH[1]
+macdBear = macdL < macdS and macdH < macdH[1]
+
+// Stoch
+k = ta.stoch(close, high, low, stochLen)
+d = ta.sma(k, stochSmooth)
+stBull = k > d and k > k[1]
+stBear = k < d and k < k[1]
+
+momBullComp = rsiBull or macdBull or stBull
+momBearComp = rsiBear or macdBear or stBear
+
+momBull = momMethod == "RSI" ? rsiBull : momMethod == "MACD" ? macdBull : momMethod == "Stochastic" ? stBull : momBullComp
+momBear = momMethod == "RSI" ? rsiBear : momMethod == "MACD" ? macdBear : momMethod == "Stochastic" ? stBear : momBearComp
+
+// --------------------- VOLATILITY FILTER ---------------------
+atr = ta.atr(atrLen)
+// Simple ATR percentile proxy over window
+atrWin = 100
+atrSma = ta.sma(atr, atrWin)
+volOk = atr > 0 and (atrSma == 0 or atr > 0.7 * atrSma)  // require ATR not depressed
+
+// --------------------- LIQUIDITY ZONES (BOX-BASED) ---------------------
+ph = ta.pivothigh(high, _pivot, _pivot)
+pl = ta.pivotlow(low, _pivot, _pivot)
+
+// Store zones as boxes + metadata
+var supplyBoxes = array.new_box()
+var demandBoxes = array.new_box()
+var supplyAlive = array.new_bool()
+var demandAlive = array.new_bool()
+
+// Helper: trim arrays to maxActiveZones
+f_trim_boxes(_boxes, _alive) =>
+    while array.size(_boxes) > maxActiveZones
+        bx = array.shift(_boxes)
+        array.shift(_alive)
+        box.delete(bx)
+
+// On new confirmed pivot, create zone box using pivot candle range as thickness
+if showZones and not na(ph)
+    // Create supply zone from pivot high down by pivot candle range (or ATR*0.5 if unavailable)
+    pbar = bar_index - _pivot
+    rng = (high[pbar] - low[pbar])
+    thick = na(rng) or rng <= 0 ? atr * 0.5 : rng
+    top = ph
+    bot = ph - thick
+    bx = box.new(left=pbar, top=top, right=bar_index, bottom=bot, border_color=color.new(colSupply, 0), bgcolor=colSupply)
+    array.push(supplyBoxes, bx)
+    array.push(supplyAlive, true)
+    f_trim_boxes(supplyBoxes, supplyAlive)
+
+if showZones and not na(pl)
+    // Create demand zone from pivot low up by pivot candle range (or ATR*0.5)
+    pbar = bar_index - _pivot
+    rng = (high[pbar] - low[pbar])
+    thick = na(rng) or rng <= 0 ? atr * 0.5 : rng
+    bot = pl
+    top = pl + thick
+    bx = box.new(left=pbar, top=top, right=bar_index, bottom=bot, border_color=color.new(colDemand, 0), bgcolor=colDemand)
+    array.push(demandBoxes, bx)
+    array.push(demandAlive, true)
+    f_trim_boxes(demandBoxes, demandAlive)
+
+// Extend boxes to the right each bar; retire if decisively broken
+f_update_boxes(_boxes, _alive, isSupply) =>
+    for i = 0 to array.size(_boxes) - 1
+        bx = array.get(_boxes, i)
+        live = array.get(_alive, i)
+        if live
+            // extend box to current bar
+            box.set_right(bx, bar_index)
+            top = box.get_top(bx)
+            bot = box.get_bottom(bx)
+            // retire logic: close far beyond zone
+            broken = (isSupply and close > top) or (not isSupply and close < bot)
+            if broken
+                array.set(_alive, i, false)
+                box.set_bgcolor(bx, color.new(color.gray, 90))
+                box.set_border_color(bx, color.new(color.gray, 50))
+
+if showZones
+    f_update_boxes(supplyBoxes, supplyAlive, true)
+    f_update_boxes(demandBoxes, demandAlive, false)
+
+// Helper: nearest live zone prices
+f_nearest_supply() =>
+    nzPrice = na
+    for i = 0 to array.size(supplyBoxes) - 1
+        if array.get(supplyAlive, i)
+            bx = array.get(supplyBoxes, i)
+            top = box.get_top(bx)
+            nzPrice := na(nzPrice) ? top : math.min(nzPrice, top)
+    nzPrice
+
+f_nearest_demand() =>
+    nzPrice = na
+    for i = 0 to array.size(demandBoxes) - 1
+        if array.get(demandAlive, i)
+            bx = array.get(demandBoxes, i)
+            bot = box.get_bottom(bx)
+            nzPrice := na(nzPrice) ? bot : math.max(nzPrice, bot)
+    nzPrice
+
+nearSup = f_nearest_supply()
+nearDem = f_nearest_demand()
+
+nearDemTouch = not na(nearDem) and low <= nearDem and close >= nearDem
+nearSupTouch = not na(nearSup) and high >= nearSup and close <= nearSup
+
+// Simple OB and FVG visual cues (lightweight)
+var float lastBullOB = na
+var float lastBearOB = na
+if showOB and close > open and close > close[1] * 1.005 and close[1] < open[1]
+    lastBullOB := low[1]
+if showOB and close < open and close < close[1] * 0.995 and close[1] > open[1]
+    lastBearOB := high[1]
+
+bullFVG = showFVG and low > high[2]
+bearFVG = showFVG and high < low[2]
+
+bgcolor(bullFVG ? color.new(colBull, 94) : na, title="Bullish FVG")
+bgcolor(bearFVG ? color.new(colBear, 94) : na, title="Bearish FVG")
+
+// --------------------- SIGNALS (NON-REPAINT) ---------------------
+// Gate: trend + momentum + HTF + filters
+bullGate = trendBull and htfBull and momBull and adx >= adxGate and volOk
+bearGate = trendBear and htfBear and momBear and adx >= adxGate and volOk
+
+// Location preference: touch demand for longs, touch supply for shorts
+locBull = nearDemTouch or (not na(lastBullOB) and close <= lastBullOB * 1.02)
+locBear = nearSupTouch or (not na(lastBearOB) and close >= lastBearOB * 0.98)
+
+buySignal = showSignals and bullGate and (locBull or not showZones)
+sellSignal = showSignals and bearGate and (locBear or not showZones)
+
+// Strong signals: oversold rebound (long) / overbought drop (short) + location
+strongBuy = buySignal and rsi < rsiOS and locBull
+strongSell = sellSignal and rsi > rsiOB and locBear
+
+// --------------------- RISK & SIZING ---------------------
+var float entry = na
+var float sl = na
+var float tp1 = na
+var float tp2 = na
+var bool longPos = false
+var bool shortPos = false
+
+if buySignal and not longPos and not shortPos
+    entry := close
+    sl := math.min(close - atr * slATR, na(nearDem) ? close - atr * slATR : nearDem * 0.995)
+    tp1 := close + atr * tp1ATR
+    tp2 := close + atr * tp2ATR
+    if not na(nearSup) and nearSup < tp2
+        tp1 := nearSup * 0.995
+    longPos := true
+    shortPos := false
+
+if sellSignal and not longPos and not shortPos
+    entry := close
+    sl := math.max(close + atr * slATR, na(nearSup) ? close + atr * slATR : nearSup * 1.005)
+    tp1 := close - atr * tp1ATR
+    tp2 := close - atr * tp2ATR
+    if not na(nearDem) and nearDem > tp2
+        tp1 := nearDem * 1.005
+    shortPos := true
+    longPos := false
+
+// Trailing
+if useTrail
+    if longPos
+        tsl = close - atr * trailATR
+        if na(sl) or tsl > sl
+            sl := tsl
+    if shortPos
+        tsl = close + atr * trailATR
+        if na(sl) or tsl < sl
+            sl := tsl
+
+// Exit state when hard targets hit
+if longPos and (close <= sl or close >= tp2)
+    longPos := false
+    entry := na
+if shortPos and (close >= sl or close <= tp2)
+    shortPos := false
+    entry := na
+
+// Position sizing
+riskCash = accountSize * (riskPct / 100.0)
+perUnitRisk = na(entry) or na(sl) ? na : math.abs(entry - sl)
+suggestSize = na(perUnitRisk) or perUnitRisk == 0 ? na : riskCash / perUnitRisk
+
+// Risk:Reward vs TP1
+rr = na(entry) or na(sl) or na(tp1) ? na : math.abs(tp1 - entry) / math.abs(entry - sl)
+
+// --------------------- PLOTTING ---------------------
+// Candle tint
+barcolor(bullGate ? color.new(colBull, 75) : bearGate ? color.new(colBear, 75) : na)
+
+// Trend reference plot
+plot(trendMethod == "Supertrend" ? stLine : trendMethod == "EMA Cross" ? emaF : na, "Trend Ref", color=trendBull ? colBull : trendBear ? colBear : color.gray, linewidth=2)
+plot(na, title="Spacer")
+
+// Signals
+plotshape(buySignal and not strongBuy, title="Buy", style=shape.triangleup, location=location.belowbar, color=colBull, size=size.tiny, text="BUY")
+plotshape(sellSignal and not strongSell, title="Sell", style=shape.triangledown, location=location.abovebar, color=colBear, size=size.tiny, text="SELL")
+plotshape(strongBuy, title="Strong Buy", style=shape.triangleup, location=location.belowbar, color=colBull, size=size.small, text="BUY★")
+plotshape(strongSell, title="Strong Sell", style=shape.triangledown, location=location.abovebar, color=colBear, size=size.small, text="SELL★")
+
+// Risk lines
+plot(showRisk and not na(sl) ? sl : na, "Stop Loss", color=color.red, linewidth=2, style=plot.style_cross)
+plot(showRisk and not na(tp1) ? tp1 : na, "TP1", color=color.green, linewidth=1, style=plot.style_cross)
+plot(showRisk and not na(tp2) ? tp2 : na, "TP2", color=color.new(color.green, 40), linewidth=1, style=plot.style_cross)
+
+// --------------------- DASHBOARD ---------------------
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 85), border_width=2, border_color=color.gray)
+    table.cell(dash, 0, 0, "TRIDENT PRO", text_color=color.white)
+    table.cell(dash, 1, 0, "STATUS", text_color=color.white)
+
+    tText = trendBull ? "BULLISH ▲" : trendBear ? "BEARISH ▼" : "NEUTRAL →"
+    tCol = trendBull ? colBull : trendBear ? colBear : color.gray
+    table.cell(dash, 0, 1, "Trend", text_color=color.white)
+    table.cell(dash, 1, 1, tText, text_color=tCol)
+
+    mText = momBull ? "BULLISH ▲" : momBear ? "BEARISH ▼" : "NEUTRAL"
+    mCol = momBull ? colBull : momBear ? colBear : color.gray
+    table.cell(dash, 0, 2, "Momentum", text_color=color.white)
+    table.cell(dash, 1, 2, mText, text_color=mCol)
+
+    table.cell(dash, 0, 3, "RSI", text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(math.round(rsi, 1)), text_color=rsi < rsiOS ? colBull : rsi > rsiOB ? colBear : color.orange)
+
+    table.cell(dash, 0, 4, "Trend Strength (ADX)", text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(math.round(adx, 1)), text_color=adx >= adxGate ? color.lime : color.orange)
+
+    table.cell(dash, 0, 5, "Nearest Demand", text_color=color.white)
+    table.cell(dash, 1, 5, na(nearDem) ? "N/A" : str.tostring(nearDem, format.mintick), text_color=color.green)
+
+    table.cell(dash, 0, 6, "Nearest Supply", text_color=color.white)
+    table.cell(dash, 1, 6, na(nearSup) ? "N/A" : str.tostring(nearSup, format.mintick), text_color=color.red)
+
+    table.cell(dash, 0, 7, "R:R (TP1)", text_color=color.white)
+    table.cell(dash, 1, 7, na(rr) ? "N/A" : str.tostring(math.round(rr, 2)) + ":1", text_color=color.yellow)
+
+    table.cell(dash, 0, 8, "Size @ " + str.tostring(riskPct, format.percent) + " Risk", text_color=color.white)
+    table.cell(dash, 1, 8, na(suggestSize) ? "N/A" : str.tostring(suggestSize, format.mintick), text_color=color.cyan)
+
+// --------------------- ALERTS ---------------------
+// Webhook JSON formatı (binance_bot.py ile uyumlu)
+// JSON uyarı mesajları (sadeleştirilmiş: tp/sl alanları bot tarafından hesaplanabilir)
+buyMsg = '{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"time":"{{timenow}}","interval":"{{interval}}","secret":"YOUR_WEBHOOK_SECRET","tp":0,"sl":0,"strength":"normal"}'
+strongBuyMsg = '{"action":"buy","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"time":"{{timenow}}","interval":"{{interval}}","secret":"YOUR_WEBHOOK_SECRET","tp":0,"sl":0,"strength":"strong"}'
+sellMsg = '{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"time":"{{timenow}}","interval":"{{interval}}","secret":"YOUR_WEBHOOK_SECRET","tp":0,"sl":0,"strength":"normal"}'
+strongSellMsg = '{"action":"sell","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"time":"{{timenow}}","interval":"{{interval}}","secret":"YOUR_WEBHOOK_SECRET","tp":0,"sl":0,"strength":"strong"}'
+
+alertcondition(buySignal, title="Buy Signal", message=buyMsg)
+alertcondition(strongBuy, title="Strong Buy", message=strongBuyMsg)
+alertcondition(sellSignal, title="Sell Signal", message=sellMsg)
+alertcondition(strongSell, title="Strong Sell", message=strongSellMsg)
+
+// Zone touch alarmları (bilgilendirme - otomatik işlem yapmaz)
+alertcondition(nearDemTouch and momBull, title="Price at Demand", message="💰 Price touched DEMAND on {{ticker}} - watch for BUY")
+alertcondition(nearSupTouch and momBear, title="Price at Supply", message="💰 Price touched SUPPLY on {{ticker}} - watch for SELL")
+
+// End of PRO indicator

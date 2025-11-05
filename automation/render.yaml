@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: trident-trader-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+  startCommand: uvicorn bot_v2_pro:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DEFAULT_RISK_PERCENT
+        value: "1.0"
+      - key: USE_TESTNET
+        value: "false"
+      - key: TRADING_MODE
+        value: "spot"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: MAX_OPEN_POSITIONS
+        value: "5"
+      - key: MIN_USDT_ORDER
+        value: "10"
+      - key: DASHBOARD_AUTH_TOKEN
+        sync: false
+      - key: ENABLE_TRAILING_STOP
+        value: "false"
+      - key: TRAILING_STOP_PERCENT
+        value: "1.5"
+      - key: ENABLE_PARTIAL_CLOSE
+        value: "true"
+      - key: PARTIAL_CLOSE_PERCENT
+        value: "50"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
